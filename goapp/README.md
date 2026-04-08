@@ -84,9 +84,17 @@ General options:
   -port int
         Port to expose metrics on (default 9417)
   -verbose
-        Displays extensive diagnostic information
+        Displays extensive diagnostic information (including raw Docker JSON output for debugging)
   -version
         Show version information
+```
+
+### Debugging
+
+If metrics are showing 0 or incorrect values, use the `--verbose` flag to see the raw Docker CLI output and identify parsing issues:
+
+```bash
+./docker_exporter --verbose
 ```
 
 ### Running

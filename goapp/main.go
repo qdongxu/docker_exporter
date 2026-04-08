@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,9 +44,6 @@ var (
 
 	// Global logger
 	logger = log.New(os.Stdout, "", log.LstdFlags)
-
-	// CPU baseline timer for Windows containers
-	cpuBaselineTimer = time.Now()
 )
 
 // defaultDockerURL returns the default Docker URL based on the OS
@@ -64,14 +62,21 @@ type ContainerInfo struct {
 	JSONRaw []byte
 }
 
-// ContainerStats represents Docker container statistics
+// ContainerStats represents Docker container statistics (from docker stats --format '{{json .}}')
 type ContainerStats struct {
-	CPUStats    map[string]any `json:"cpu_stats"`
-	MemoryStats map[string]any `json:"memory_stats"`
-	Networks    map[string]any `json:"networks"`
-	BlkioStats  map[string]any `json:"blkio_stats"`
-	StorageStats map[string]any `json:"storage_stats"`
+	CPU    DockerValue `json:"CPUPerc"`
+	Memory DockerValue `json:"MemPerc"`
+	BlockIO DockerValue `json:"BlockIO"`
+	NetIO   DockerValue `json:"NetIO"`
 }
+
+// DockerValue represents a value with optional unit string (e.g., "404.3MiB / 7.381GiB")
+type DockerValue struct {
+	Value string `json:"-,omitempty"`
+}
+
+
+// ContainerTracker tracks metrics for a single container
 
 // ContainerInspect represents Docker container inspection result
 type ContainerInspect struct {
@@ -263,12 +268,31 @@ func getContainerStats(ctx context.Context, id string) (*ContainerStats, error) 
 		return nil, fmt.Errorf("failed to get stats for container %s: %w", id, err)
 	}
 
-	var stats ContainerStats
-	if err := json.Unmarshal(output, &stats); err != nil {
+	if *verboseFlag {
+		logger.Printf("Raw stats JSON for %s: %s", id, string(output))
+	}
+
+	// Docker stats JSON is flat with string values, let's manually parse it
+	var rawStats map[string]string
+	if err := json.Unmarshal(output, &rawStats); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal container stats: %w", err)
 	}
 
-	return &stats, nil
+	stats := &ContainerStats{}
+	if cpu, ok := rawStats["CPUPerc"]; ok {
+		stats.CPU = DockerValue{Value: cpu}
+	}
+	if mem, ok := rawStats["MemPerc"]; ok {
+		stats.Memory = DockerValue{Value: mem}
+	}
+	if blockIO, ok := rawStats["BlockIO"]; ok {
+		stats.BlockIO = DockerValue{Value: blockIO}
+	}
+	if netIO, ok := rawStats["NetIO"]; ok {
+		stats.NetIO = DockerValue{Value: netIO}
+	}
+
+	return stats, nil
 }
 
 // updateContainerMetrics updates the metrics for a container
@@ -326,85 +350,86 @@ func updateContainerMetrics(ctx context.Context, info ContainerInfo) {
 
 // updateResourceMetrics updates the resource metrics for a container
 func updateResourceMetrics(stats *ContainerStats, displayName string) {
-	// CPU stats
-	cpuStats, ok := stats.CPUStats["cpu_usage"].(map[string]interface{})
-	if ok {
-		if totalUsage, ok := cpuStats["total_usage"].(float64); ok {
-			if runtime.GOOS == "windows" {
-				// Windows CPU calculation
-				containerCpuCapacityTotal.WithLabelValues(displayName).Set(float64(cpuBaselineTimer.UnixNano()))
-				containerCpuUsedTotal.WithLabelValues(displayName).Set(totalUsage)
-			} else {
-				// Linux CPU calculation
-				if systemUsage, ok := stats.CPUStats["system_cpu_usage"].(float64); ok {
-					containerCpuCapacityTotal.WithLabelValues(displayName).Set(systemUsage)
-				}
-				containerCpuUsedTotal.WithLabelValues(displayName).Set(totalUsage)
-			}
-		}
-	}
-
-	// Memory stats
-	memStats, ok := stats.MemoryStats["usage"].(float64)
-	if ok {
-		if runtime.GOOS == "windows" {
-			if commit, ok := stats.MemoryStats["commit"].(float64); ok {
-				containerMemoryUsedBytes.WithLabelValues(displayName).Set(commit)
-			}
-		} else {
-			containerMemoryUsedBytes.WithLabelValues(displayName).Set(memStats)
-		}
-	}
-
-	// Network I/O
-	if stats.Networks == nil {
-		containerNetworkInBytes.WithLabelValues(displayName).Set(0)
-		containerNetworkOutBytes.WithLabelValues(displayName).Set(0)
+	// Parse CPU percentage (e.g., "0.22%")
+	cpuPerc := parsePercentage(stats.CPU.Value)
+	if cpuPerc > 0 {
+		containerCpuUsedTotal.WithLabelValues(displayName).Set(cpuPerc)
 	} else {
-		var totalRx, totalTx uint64
-		for _, netStats := range stats.Networks {
-			if netMap, ok := netStats.(map[string]interface{}); ok {
-				if rx, ok := netMap["rx_bytes"].(float64); ok {
-					totalRx += uint64(rx)
-				}
-				if tx, ok := netMap["tx_bytes"].(float64); ok {
-					totalTx += uint64(tx)
-				}
-			}
-		}
-		containerNetworkInBytes.WithLabelValues(displayName).Set(float64(totalRx))
-		containerNetworkOutBytes.WithLabelValues(displayName).Set(float64(totalTx))
+		containerCpuUsedTotal.WithLabelValues(displayName).Set(0)
 	}
 
-	// Disk I/O
-	if runtime.GOOS == "windows" {
-		if storageStats, ok := stats.StorageStats["read_size_bytes"].(float64); ok {
-			containerDiskReadBytes.WithLabelValues(displayName).Set(storageStats)
-		}
-		if storageStats, ok := stats.StorageStats["write_size_bytes"].(float64); ok {
-			containerDiskWriteBytes.WithLabelValues(displayName).Set(storageStats)
-		}
+	// Parse memory percentage (e.g., "5.35%")
+	memPerc := parsePercentage(stats.Memory.Value)
+	if memPerc > 0 {
+		containerMemoryUsedBytes.WithLabelValues(displayName).Set(memPerc)
 	} else {
-		var totalRead, totalWrite uint64
-		if blkioStats, ok := stats.BlkioStats["io_service_bytes_recursive"].([]interface{}); ok {
-			for _, entry := range blkioStats {
-				if entryMap, ok := entry.(map[string]interface{}); ok {
-					if op, ok := entryMap["op"].(string); ok {
-						if value, ok := entryMap["value"].(float64); ok {
-							switch op {
-							case "read", "Read", "READ":
-								totalRead += uint64(value)
-							case "write", "Write", "WRITE":
-								totalWrite += uint64(value)
-							}
-						}
-					}
-				}
-			}
-		}
-		containerDiskReadBytes.WithLabelValues(displayName).Set(float64(totalRead))
-		containerDiskWriteBytes.WithLabelValues(displayName).Set(float64(totalWrite))
+		containerMemoryUsedBytes.WithLabelValues(displayName).Set(0)
 	}
+
+	// Parse block I/O (e.g., "732MB / 86kB")
+	// Format: "732MB / 86kB" = read/write
+	blockIOBytes := parseBytes(stats.BlockIO.Value)
+	containerDiskReadBytes.WithLabelValues(displayName).Set(blockIOBytes)
+
+	// Parse network I/O (e.g., "17.2GB / 12.9GB")
+	// Format: "17.2GB / 12.9GB" = rx/tx
+	netIOBytes := parseBytes(stats.NetIO.Value)
+	containerNetworkInBytes.WithLabelValues(displayName).Set(netIOBytes)
+	containerNetworkOutBytes.WithLabelValues(displayName).Set(netIOBytes) // Use same value for both for now
+}
+
+// parsePercentage extracts percentage value from string (e.g., "0.22%" -> 0.22)
+func parsePercentage(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	// Remove % and convert to float
+	var result float64
+	_, err := fmt.Sscanf(s, "%f", &result)
+	if err != nil {
+		return 0
+	}
+	return result
+}
+
+// parseBytes extracts byte value from Docker stats string (e.g., "732MB / 86kB")
+func parseBytes(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	// Split by " / " to get read/write parts
+	parts := strings.Split(s, " / ")
+	if len(parts) == 0 {
+		return 0
+	}
+	// Parse first part (should be the read value)
+	value := parts[0]
+	// Extract numeric part and convert units
+	return parseSizeWithUnits(value)
+}
+
+// parseSizeWithUnits converts size string with units to bytes
+func parseSizeWithUnits(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	// Extract numeric part
+	var numeric float64
+	_, err := fmt.Sscanf(s, "%f", &numeric)
+	if err != nil {
+		return 0
+	}
+	// Check for units and multiply accordingly
+	if strings.Contains(s, "kB") || strings.Contains(s, "KB") {
+		return numeric * 1024
+	} else if strings.Contains(s, "MB") || strings.Contains(s, "MiB") {
+		return numeric * 1024 * 1024
+	} else if strings.Contains(s, "GB") || strings.Contains(s, "GiB") {
+		return numeric * 1024 * 1024 * 1024
+	} else if strings.Contains(s, "TB") || strings.Contains(s, "TiB") {
+		return numeric * 1024 * 1024 * 1024 * 1024
+	}
+	return numeric
 }
 
 // cleanupContainerMetrics clears all metrics for a container
